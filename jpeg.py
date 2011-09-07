@@ -107,6 +107,16 @@ class Jpeg(object):
 				53, 60, 61, 54, 47, 55, 62, 63]
 	}
 
+	# DCT encoding types -- retrieve from SOF marker code
+	# We use these as keys into self.encoding_type
+	encoding_types = [
+			'sequential',
+			'progressive',
+			'arithmetic_code',
+			'lossless',
+			'differential',
+	]
+
 
 
 	def __init__(self, buf):
@@ -129,6 +139,7 @@ class Jpeg(object):
 		self.quantization_high_precision = [False, False, False, False]
 
 		# Attributes gathered from SOF header
+		self.encoding_type = {}
 
 		self.build_from_buf()
 
@@ -312,11 +323,96 @@ class Jpeg(object):
 
 	marker_handlers['DQT'] = handle_dqt
 
-	def handle_sof0(self):
+	# We define a single place to actually handle SOF headers
+	#	The marker code for each kind of SOF defines its type, but the
+	#	fields are the same across all kinds
+	def handle_sof(self, **kwargs):
+		# Allow the individual handlers to just specify which types are True
+		#	Assume the rest are false
+		for t in self.encoding_types:
+			self.encoding_type[t] = kwargs.get(t, False)
+
+		index = self._index
+
+		length = struct.unpack('>H', self._buf[index:index+2])[0]
 
 		self._index = index
 
+	# And now we define the individual SOF types
+	# SOF0 - Baseline DCT - no encoding types
+	def handle_sof0(self):
+		return self.handle_sof()
 	marker_handlers['SOF0'] = handle_sof0
+
+	# SOF1 - Sequential
+	def handle_sof1(self):
+		return self.handle_sof(sequential=True)
+	marker_handlers['SOF1'] = handle_sof1
+
+	# SOF2 - Progressive
+	def handle_sof2(self):
+		return self.handle_sof(progressive=True)
+	marker_handlers['SOF2'] = handle_sof2
+
+	# SOF3 - Lossless
+	def handle_sof3(self):
+		return self.handle_sof(lossless=True)
+	marker_handlers['SOF3'] = handle_sof3
+
+	# SOF4 - Doesn't exist!
+
+	# SOF5 - Sequential / Differential coding
+	def handle_sof5(self):
+		return self.handle_sof(sequential=True, differential=True)
+	marker_handlers['SOF5'] = handle_sof5
+
+	# SOF6 - Progressive / Differential coding
+	def handle_sof6(self):
+		return self.handle_sof(progressive=True, differential=True)
+	marker_handlers['SOF6'] = handle_sof6
+	
+	# SOF7 - Lossless / Differential coding
+	def handle_sof7(self):
+		return self.handle_sof(lossless=True, differential=True)
+	marker_handlers['SOF7'] = handle_sof7
+
+	# SOF8 (SOF 'JPEG') - ??? coding
+	def handle_sof_jpeg(self):
+		return self.handle_sof()
+	#marker_handlers['SOF_JPEG'] = handle_sof_jpeg
+
+	# SOF9 - Sequential / Arithmetic coding
+	def handle_sof9(self):
+		return self.handle_sof(sequential=True, arithmetic=True)
+	marker_handlers['SOF9'] = handle_sof9
+
+	# SOF10 - Progressive / Arithmetic coding
+	def handle_sof10(self):
+		return self.handle_sof(progressive=True, arithmetic=True)
+	marker_handlers['SOF10'] = handle_sof10
+
+	# SOF11 - Lossless / Arithmetic coding
+	def handle_sof11(self):
+		return self.handle_sof(progressive=True, differential=True)
+	marker_handlers['SOF11'] = handle_sof11
+
+	# SOF12 - Doesn't exist!
+
+	# SOF13 - Sequential / Differential / Arithmetic coding
+	def handle_sof13(self):
+		return self.handle_sof(sequential=True, differential=True, arithmetic=True)
+	marker_handlers['SOF13'] = handle_sof13
+
+	# SOF14 - Progressive / Differential / Arithmetic coding
+	def handle_sof14(self):
+		return self.handle_sof(progressive=True, differential=True, arithmetic=True)
+	marker_handlers['SOF14'] = handle_sof14
+
+	# SOF15 - Lossless / Differential / Arithmetic coding
+	def handle_sof15(self):
+		return self.handle_sof(lossless=True, differential=True, arithmetic=True)
+	marker_handlers['SOF15'] = handle_sof15
+
 
 
 class Foo(object):
