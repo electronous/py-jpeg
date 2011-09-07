@@ -19,6 +19,7 @@ class Jpeg(object):
 
 	# various constants
 	MAX_QUANTIZATION_TABLES = 4
+	MAX_HUFFMAN_TABLES = 4
 
 	# marker codes that identify the various headers in JPEG
 	markers = {
@@ -140,6 +141,15 @@ class Jpeg(object):
 
 		# Attributes gathered from SOF header
 		self.encoding_type = {}
+		self.sample_precision = 0
+		self.image_height = 0
+		self.image_width = 0
+		self.components = []
+
+		# Attributes gathered from DHT header
+		self.huffman_data = [None] * self.MAX_HUFFMAN_TABLES
+		for i in range(self.MAX_HUFFMAN_TABLES):
+			self.huffman_data[i] = [None, None]
 
 		self.build_from_buf()
 
@@ -184,6 +194,8 @@ class Jpeg(object):
 		index += length
 		self._index = index
 
+	# Almost all the APP headers are headers we don't care about
+	# We DO care about APP 0 though
 	marker_handlers['APP1'] = handle_uninteresting_variable_length_header
 	marker_handlers['APP2'] = handle_uninteresting_variable_length_header
 	marker_handlers['APP3'] = handle_uninteresting_variable_length_header
@@ -197,6 +209,7 @@ class Jpeg(object):
 	marker_handlers['APP11'] = handle_uninteresting_variable_length_header
 	marker_handlers['APP12'] = handle_uninteresting_variable_length_header
 	marker_handlers['APP13'] = handle_uninteresting_variable_length_header
+	# We also care about APP14 in some cases
 	marker_handlers['APP15'] = handle_uninteresting_variable_length_header
 
 	def handle_soi(self):
@@ -256,6 +269,7 @@ class Jpeg(object):
 		thumbnail_size = 3 * thumbnail_x_dim * thumbnail_y_dim # packed RGB values
 		if length - (interesting + 2) != thumbnail_size:
 			raise BadFieldError('APP0')
+		index += thumbnail_size
 
 		self._index = index
 
@@ -273,6 +287,7 @@ class Jpeg(object):
 
 		# quantization table number is the bottom 4 bits, precision is a boolean from top 4 of
 		# if we have precision marker, we use twice as many bytes for quant. table
+		# note that the precision of the actual dct samples is stored in the sof header, not here
 		quant_num_and_prec = struct.unpack('B', self._buf[index])[0]
 		index += 1
 		quant_num = quant_num_and_prec & 0x0f
@@ -335,6 +350,43 @@ class Jpeg(object):
 		index = self._index
 
 		length = struct.unpack('>H', self._buf[index:index+2])[0]
+		index += 2
+
+		self.sample_precision = struct.unpack('B', self._buf[index])[0]
+		index += 1
+		self.image_height = struct.unpack('>H', self._buf[index:index+2])[0]
+		index += 2
+		self.image_width = struct.unpack('>H', self._buf[index:index+2])[0]
+		index += 2
+		num_components = struct.unpack('B', self._buf[index])[0]
+		index += 1
+
+		if self.image_height == 0:
+			raise BadFieldError()
+
+		if self.image_width == 0:
+			raise BadFieldError()
+
+		if num_components == 0:
+			raise BadFieldError()
+
+		# 8 bytes removed from length to cover previous fields
+		# 3 bytes retrieved per component
+		if (length - 8) != (3 * num_components):
+			raise BadFieldError()
+
+		# XXX handle case where this header isn't present (not here)
+		for i in range(num_components):
+			component_id = struct.unpack('B', self._buf[index])[0]
+			sample_factor = struct.unpack('B', self._buf[index + 1])[0]
+			quant_tbl_index = struct.unpack('B', self._buf[index + 2])[0]
+			index += 3
+			h_sample_factor = (sample_factor >> 4) & 0x0f
+			v_sample_factor = sample_factor & 0x0f
+			if quant_tbl_index >= self.MAX_QUANTIZATION_TABLES:
+				raise BadFieldError()
+			d = {'id': component_id, 'h_factor': h_sample_factor, 'v_factor': v_sample_factor, 'quant_tbl_index': quant_tbl_index}
+			self.components.append(d)
 
 		self._index = index
 
@@ -413,6 +465,77 @@ class Jpeg(object):
 		return self.handle_sof(lossless=True, differential=True, arithmetic=True)
 	marker_handlers['SOF15'] = handle_sof15
 
+	# DHT - Define Huffman Tree
+	# These huffman trees are used as the first step in getting the DCT components in the image data
+	# We don't actually build the trees yet, that will come later in handle_sos
+	def handle_dht(self):
+		MAX_SYMBOL_LENGTH = 16 # bits
+		MAX_NUM_SYMBOLS = 256
+
+		index = self._index
+
+		length = struct.unpack('>H', self._buf[index:index+2])[0]
+		index += 2
+
+		# We get one section of one component at a time
+		# Every component has 2 huffman trees -- one for the DC, and one for the AC
+		# There is no field telling us how many sections to expect, so we just march along until we run out
+		#	In fact, 4 trees could be defined by 4 calls to handle_dht with 1 tree each, 1 call to handle_dht with 4 trees, etc
+		# Also, we don't really check inside the loop if we violate the length but we will check after
+		while index < self._index + length:
+			huffman_index = struct.unpack('B', self._buf[index])[0]
+			index += 1
+
+			# next we grab the number of entries at each bit depth in this tree
+			# e.g. 0,0,1,4 -> 1 symbol of length 2 bits, 4 symbols of length 3 bits, etc.
+			# we also maintain a running total of how many symbols are in the tree
+			total = 0
+			counts = [0] * MAX_SYMBOL_LENGTH
+			for i in range(MAX_SYMBOL_LENGTH):
+				counts[i] = struct.unpack('B', self._buf[index])[0]
+				index += 1
+				total += counts[i]
+
+			if total > MAX_NUM_SYMBOLS:
+				raise BadFieldError()
+
+			# next we retrieve the ordered huffman tree values
+			# these values will fill the tree in row order, left to right
+			values = [0] * total
+			for i in range(total):
+				values[i] = struct.unpack('B', self._buf[index])[0]
+				index += 1
+
+			# finally, we save this information to huffman_raw_data
+			# huffman_index has a bit flag in the high nibble to indicate dc or ac
+			# we're going to take the flag off here
+			# is_ac == !is_dc
+			is_ac = bool(huffman_index & 0x10)
+			huffman_index &= 0x0f
+
+			if huffman_index > self.MAX_HUFFMAN_TABLES:
+				raise BadFieldError()
+
+			self.huffman_data[huffman_index][int(is_ac)] = (counts, values)
+
+		if index != self._index + length:
+			raise BadFieldError()
+
+		self._index = index
+
+	marker_handlers['DHT'] = handle_dht
+
+	# here's where we actually build the RGB output pixels and validate consistency of headers
+	def handle_sos(self):
+		pass
+
+	marker_handlers['SOS'] = handle_sos
+
+	# EOI indicates that we have reached the end of the image, so we're done
+	def handle_eoi(self):
+		pass
+
+	marker_handlers['EOI'] = handle_eoi
 
 
 class Foo(object):
