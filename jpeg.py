@@ -13,6 +13,100 @@ class MarkerNotHandledError(Exception):
 class BadFieldError(Exception):
 	pass
 
+class BadHuffmanTreeError(Exception):
+	pass
+
+class JpegHuffman(object):
+	def __init__(self, cv_tuple):
+		counts = cv_tuple[0]
+		values = cv_tuple[1]
+
+		self.build_lookups(counts, values)
+
+	# build lookup dictionaries of code --> (symbol, length of symbol)
+	#	this function assumes that codes are up to 2 bytes in length
+	# in order to reduce the amount of checking required to retrieve
+	#	a symbol, we just pass an entire byte into the high dict
+	#	and then conditionally into the corresponding low dict if necessary
+	def build_lookups(self, counts, values):
+		MAX_CODE = 0xff
+
+		counts_high = counts[:8]
+		counts_low = counts[8:]
+
+		self.high = {}
+		high = self.high
+
+		interval = 0x80
+		code = 0
+		length = 1
+		# counts[0] <--> codes of length 1
+		for count in counts_high:
+			if (count * interval) + code > MAX_CODE:
+				raise BadHuffmanTreeError(code, count, interval)
+			for i in range(count):
+				val = values.pop(0)
+				for j in range(interval):
+					high[code + j] = (val, length)
+				code += interval
+			interval >>= 1
+			length += 1
+
+		# short circuit - if we placed code MAX_CODE then we are done
+		#	note that this implies code == MAX_CODE + 1
+		if code == (MAX_CODE + 1):
+			return
+
+		print code
+
+		# we didn't place all the codes in the high set, so now we need to do
+		#	the remaining ones across 1 or more low sets
+		lows = []
+		for i in range(code, MAX_CODE + 1):
+			low = {}
+			high[i] = (low, -1) # we use length = -1 to indicate more checking required
+			lows.append(low)
+
+		interval = 0x80
+		num_lows = len(lows)
+		code = 0
+		# and length = 9
+		# now build all the lows
+		# similar to above, but when we run out of space in one low, we hop to the next
+		# note that no value can cross multiple lows and we pop a low off once it is full
+		for count in counts_low:
+			# this is the same validation as above but modified to allow multiple dicts
+			# note that it evaluates the same if num_lows == 1
+			if (count * interval) + code > (((MAX_CODE + 1) * num_lows) - 1):
+				raise BadHuffmanTreeError(code, count, interval)
+			for i in range(count):
+				low = lows[0]
+				val = values.pop(0)
+				# it can be shown that this will never overflow a low
+				# interval decreases monotonically and is always a power of 2
+				#	as a result, it will always pack to the end of one low perfectly
+				for j in range(interval):
+					low[code + j] = (val, length)
+				code += interval
+				# now determine if we filled that low
+				#	remove filled low and reset code to 0
+				if code == (MAX_CODE + 1):
+					lows.pop(0)
+					code = 0
+			interval >>= 1
+			length += 1
+
+		# XXX fill any remaining slots with bad code indicator ?
+
+	def lookup(self, full_2bytes):
+		high_byte = (full_2bytes >> 8) & 0xff
+		high_val, high_len = self.high[high_byte]
+		if high_len >= 0:
+			return high_val, high_len
+
+		low_byte = full_2bytes & 0xff
+		return high_val[low_byte]
+
 class Jpeg(object):
 	# Please note the widespread use of self._index and self._buf throughout member functions here
 	# self._index will get modified across most calls
@@ -118,8 +212,6 @@ class Jpeg(object):
 			'differential',
 	]
 
-
-
 	def __init__(self, buf):
 		self._index = 0
 		self._buf = buf[:]
@@ -148,8 +240,13 @@ class Jpeg(object):
 
 		# Attributes gathered from DHT header
 		self.huffman_data = [None] * self.MAX_HUFFMAN_TABLES
+		# each has dc, ac component
 		for i in range(self.MAX_HUFFMAN_TABLES):
 			self.huffman_data[i] = [None, None]
+
+		# SOS
+		self.huffman_ac = []
+		self.huffman_dc = []
 
 		self.build_from_buf()
 
@@ -506,7 +603,7 @@ class Jpeg(object):
 				values[i] = struct.unpack('B', self._buf[index])[0]
 				index += 1
 
-			# finally, we save this information to huffman_raw_data
+			# finally, we save this information to self.huffman_data
 			# huffman_index has a bit flag in the high nibble to indicate dc or ac
 			# we're going to take the flag off here
 			# is_ac == !is_dc
@@ -527,7 +624,18 @@ class Jpeg(object):
 
 	# here's where we actually build the RGB output pixels and validate consistency of headers
 	def handle_sos(self):
-		pass
+		# now build the huffman objects
+		for l in self.huffman_data:
+			dc = l[0]
+			ac = l[1]
+
+			# XXX make sure the indices store correctly
+			if dc is not None:
+				self.huffman_dc.append(JpegHuffman(dc))
+			if ac is not None:
+				self.huffman_ac.append(JpegHuffman(ac))
+
+		raise BadFieldError()
 
 	marker_handlers['SOS'] = handle_sos
 
